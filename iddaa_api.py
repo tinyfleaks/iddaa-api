@@ -68,25 +68,41 @@ def scrape_iddaa() -> dict:
         'Chrome/122.0.0.0 Safari/537.36'
     )
 
-    # Railway'de chromedriver yolunu bul
+    # Chromium binary yolunu bul (Nix/Railway öncelikli)
+    chrome_paths = [
+        '/nix/var/nix/profiles/default/bin/chromium',
+        '/nix/var/nix/profiles/default/bin/chromium-browser',
+        '/usr/bin/chromium',
+        '/usr/bin/chromium-browser',
+        '/usr/bin/google-chrome',
+    ]
+    for p in chrome_paths:
+        if os.path.exists(p):
+            opts.binary_location = p
+            log.info(f"Chromium bulundu: {p}")
+            break
+
+    # Chromedriver yolunu bul
+    chromedriver_paths = [
+        '/nix/var/nix/profiles/default/bin/chromedriver',
+        '/usr/bin/chromedriver',
+        '/usr/local/bin/chromedriver',
+    ]
     chromedriver_path = None
-    for path in ['/usr/bin/chromedriver', '/usr/local/bin/chromedriver']:
-        if os.path.exists(path):
-            chromedriver_path = path
+    for p in chromedriver_paths:
+        if os.path.exists(p):
+            chromedriver_path = p
+            log.info(f"Chromedriver bulundu: {p}")
             break
 
     if chromedriver_path:
         service = Service(chromedriver_path)
         driver = webdriver.Chrome(service=service, options=opts)
     else:
-        # webdriver-manager ile otomatik indir
-        try:
-            from webdriver_manager.chrome import ChromeDriverManager
-            driver = webdriver.Chrome(
-                service=Service(ChromeDriverManager().install()),
-                options=opts)
-        except Exception:
-            driver = webdriver.Chrome(options=opts)
+        from webdriver_manager.chrome import ChromeDriverManager
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=opts)
 
     odds_map = {}
     screenshot_b64 = None
@@ -422,3 +438,4 @@ if __name__ == '__main__':
     import threading
     threading.Thread(target=get_cached_odds, daemon=True).start()
     app.run(host='0.0.0.0', port=PORT, debug=False)
+  
