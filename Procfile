@@ -1,1 +1,1 @@
-web: python iddaa_api.py
+web: playwright install-deps chromium && python iddaa_api.py
