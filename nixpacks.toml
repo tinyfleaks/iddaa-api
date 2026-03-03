@@ -1,0 +1,5 @@
+[phases.setup]
+nixPkgs = ["python311", "chromium", "chromedriver"]
+
+[start]
+cmd = "python iddaa_api.py"
