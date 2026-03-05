@@ -1,12 +1,13 @@
 """
-iddaa_api.py — İddaa.com Playwright Scraper API
-Railway'de ayrı servis olarak çalışır.
+iddaa_api.py — İddaa.com HTTP Scraper API
+Tarayıcı gerektirmez, direkt HTTP istekleri kullanır.
 """
 
 import os
 import json
 import time
 import logging
+import requests
 from datetime import datetime, timedelta
 from threading import Lock
 from flask import Flask, jsonify, request
@@ -17,145 +18,152 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-API_SECRET = os.environ.get('IDDAA_KEY', 'trinity2024')
+IDDAA_KEY  = os.environ.get('IDDAA_KEY', 'trinity2024')
 CACHE_TTL  = int(os.environ.get('CACHE_TTL_MIN', '30'))
 PORT       = int(os.environ.get('PORT', 8080))
 
 _cache: dict = {}
 _cache_lock  = Lock()
 
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) '
+                  'AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'tr-TR,tr;q=0.9,en;q=0.8',
+    'Referer': 'https://www.iddaa.com/',
+    'Origin': 'https://www.iddaa.com',
+}
 
-def scrape_iddaa() -> tuple:
-    """Playwright ile iddaa.com'dan oranları çek."""
-    from playwright.sync_api import sync_playwright
+ENDPOINTS = [
+    'https://sportprogram.iddaa.com/api/sportprogram/programs?sportId=1&programType=0',
+    'https://sportprogram.iddaa.com/api/sportprogram/programs?sportId=1&programType=1',
+    'https://sportsbettingapi.iddaa.com/api/sports/1/events?date=today',
+    'https://www.iddaa.com/api/sportprogram/programs?sportId=1',
+]
 
+
+def parse_events(events: list) -> dict:
     odds_map = {}
-    screenshot_b64 = None
+    today = datetime.now().date()
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                '--no-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-blink-features=AutomationControlled',
-            ]
-        )
-        context = browser.new_context(
-            viewport={'width': 1280, 'height': 900},
-            locale='tr-TR',
-            user_agent=(
-                'Mozilla/5.0 (X11; Linux x86_64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/122.0.0.0 Safari/537.36'
-            )
-        )
-        page = context.new_page()
+    for ev in events:
+        # Tarih kontrolü
+        for date_field in ['eventDate', 'date', 'matchDate', 'startTime']:
+            date_val = ev.get(date_field, '')
+            if date_val:
+                try:
+                    if 'T' in str(date_val):
+                        match_date = datetime.fromisoformat(
+                            str(date_val).replace('Z', '+00:00')).date()
+                    else:
+                        match_date = datetime.strptime(
+                            str(date_val)[:10], '%Y-%m-%d').date()
+                    if match_date != today:
+                        break
+                except Exception:
+                    pass
 
-        try:
-            # 1. Önce JSON API'yi dene
-            log.info("İddaa mobil API deneniyor...")
+        home = (ev.get('homeTeamName') or ev.get('home') or
+                ev.get('homeName') or ev.get('homeTeam') or '')
+        away = (ev.get('awayTeamName') or ev.get('away') or
+                ev.get('awayName') or ev.get('awayTeam') or '')
+        if not home or not away:
+            continue
+
+        o1 = o0 = o2 = ust = alt = None
+        outcomes = (ev.get('outcomes') or ev.get('odds') or
+                    ev.get('markets') or [])
+
+        for out in outcomes:
+            name  = str(out.get('outcomeName') or out.get('name') or
+                        out.get('type') or '')
+            price = out.get('odd') or out.get('price') or out.get('value')
+            if not price:
+                continue
             try:
-                api_resp = page.goto(
-                    'https://sportprogram.iddaa.com/api/sportprogram/programs?sportId=1&programType=0',
-                    timeout=15000, wait_until='domcontentloaded')
-                if api_resp and api_resp.status == 200:
-                    body = page.content()
-                    import re
-                    match = re.search(r'<pre[^>]*>(.*?)</pre>', body, re.DOTALL)
-                    data = json.loads(match.group(1) if match else body)
-                    events = (data.get('data', {}).get('events', [])
-                              or data.get('events', []) or [])
-                    log.info(f"JSON API: {len(events)} etkinlik")
-                    for ev in events:
-                        home = ev.get('homeTeamName', '') or ev.get('home', '')
-                        away = ev.get('awayTeamName', '') or ev.get('away', '')
-                        if not home or not away:
-                            continue
-                        o1 = o0 = o2 = None
-                        for out in ev.get('outcomes', ev.get('odds', [])):
-                            name  = str(out.get('outcomeName', out.get('name', '')))
-                            price = out.get('odd', out.get('price'))
-                            if not price:
-                                continue
-                            price = float(price)
-                            if name == '1':   o1 = price
-                            elif name == 'X': o0 = price
-                            elif name == '2': o2 = price
-                        if o1 and o1 > 1.0:
-                            odds_map[f"{home}||{away}"] = {
-                                '1': o1, '0': o0, '2': o2,
-                                'ust': None, 'alt': None,
-                                '_bookmaker': 'iddaa',
-                                '_source': 'iddaa_json_api',
-                            }
-            except Exception as api_err:
-                log.warning(f"JSON API hatası: {api_err}")
+                price = float(price)
+            except Exception:
+                continue
+            if price <= 1.0:
+                continue
 
-            # 2. JSON başarısızsa HTML sayfayı tara
-            if not odds_map:
-                log.info("HTML sayfa taranıyor...")
-                page.goto('https://www.iddaa.com/program/futbol',
-                          timeout=20000, wait_until='networkidle')
-                time.sleep(2)
+            if name in ('1', 'MS 1', 'home'):       o1  = price
+            elif name in ('X', '0', 'MS X', 'draw'): o0  = price
+            elif name in ('2', 'MS 2', 'away'):      o2  = price
+            elif name in ('Üst 2.5', 'Over', 'ÜST'): ust = price
+            elif name in ('Alt 2.5', 'Under', 'ALT'): alt = price
 
-                for sel in ['#CybotCookiebotDialogBodyButtonAccept',
-                            'button:has-text("Kabul")', 'button:has-text("Tamam")']:
-                    try:
-                        page.click(sel, timeout=2000)
+        if o1 and o1 > 1.0:
+            odds_map[f"{home}||{away}"] = {
+                '1': o1, '0': o0, '2': o2,
+                'ust': ust, 'alt': alt,
+                '_bookmaker': 'iddaa',
+                '_source': 'iddaa_api',
+            }
+
+    return odds_map
+
+
+def scrape_iddaa() -> dict:
+    odds_map = {}
+
+    for url in ENDPOINTS:
+        try:
+            log.info(f"Deneniyor: {url}")
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            log.info(f"  → Status: {r.status_code}")
+
+            if r.status_code != 200:
+                continue
+
+            data = r.json()
+            log.info(f"  → JSON keys: {list(data.keys())[:5]}")
+
+            # Farklı yapıları dene
+            events = []
+            for key in ['data', 'result', 'response', 'body']:
+                sub = data.get(key)
+                if isinstance(sub, dict):
+                    events = (sub.get('events') or sub.get('matches') or
+                              sub.get('programs') or [])
+                    if events:
                         break
-                    except Exception:
-                        pass
+                elif isinstance(sub, list):
+                    events = sub
+                    break
 
-                import base64
-                screenshot_b64 = base64.b64encode(
-                    page.screenshot(full_page=False)).decode()
+            if not events:
+                # Direkt liste mi?
+                if isinstance(data, list):
+                    events = data
+                else:
+                    # Her key'i tara
+                    for k, v in data.items():
+                        if isinstance(v, list) and len(v) > 0:
+                            events = v
+                            break
 
-                for sel in ['tr.event-row', 'tr[class*="program"]',
-                            '.program-table tbody tr', 'table tbody tr']:
-                    rows = page.query_selector_all(sel)
-                    if rows:
-                        log.info(f"{len(rows)} satır bulundu ({sel})")
-                        for row in rows:
-                            try:
-                                home = away = None
-                                for ts in ['td.home-team', 'td[class*="home"]', '.home']:
-                                    el = row.query_selector(ts)
-                                    if el:
-                                        home = el.inner_text().strip()
-                                        break
-                                for ts in ['td.away-team', 'td[class*="away"]', '.away']:
-                                    el = row.query_selector(ts)
-                                    if el:
-                                        away = el.inner_text().strip()
-                                        break
-                                if not home or not away:
-                                    continue
-                                cells = row.query_selector_all('td[class*="odd"], .odd-value')
-                                o1 = o0 = o2 = None
-                                if len(cells) >= 3:
-                                    try: o1 = float(cells[0].inner_text().strip().replace(',', '.'))
-                                    except: pass
-                                    try: o0 = float(cells[1].inner_text().strip().replace(',', '.'))
-                                    except: pass
-                                    try: o2 = float(cells[2].inner_text().strip().replace(',', '.'))
-                                    except: pass
-                                if o1 and o1 > 1.0:
-                                    odds_map[f"{home}||{away}"] = {
-                                        '1': o1, '0': o0, '2': o2,
-                                        'ust': None, 'alt': None,
-                                        '_bookmaker': 'iddaa',
-                                        '_source': 'playwright',
-                                    }
-                            except Exception:
-                                continue
-                        break
-        finally:
-            browser.close()
+            log.info(f"  → {len(events)} etkinlik bulundu")
+            if events:
+                odds_map = parse_events(events)
+                if odds_map:
+                    log.info(f"  ✅ {len(odds_map)} maç oranı alındı")
+                    break
 
-    log.info(f"Toplam {len(odds_map)} maç oranı toplandı")
-    return odds_map, screenshot_b64
+        except Exception as e:
+            log.warning(f"  ⚠️ Hata ({url}): {e}")
+            continue
+
+    if not odds_map:
+        log.warning("Tüm endpointler başarısız, ham veriyi logla")
+        # Son endpoint'ten ham veriyi logla
+        try:
+            r = requests.get(ENDPOINTS[0], headers=HEADERS, timeout=15)
+            log.info(f"Ham veri (ilk 500 karakter): {r.text[:500]}")
+        except Exception:
+            pass
+
+    return odds_map
 
 
 def get_cached_odds(force: bool = False) -> dict:
@@ -165,9 +173,9 @@ def get_cached_odds(force: bool = False) -> dict:
                 and now - _cache['ts'] < timedelta(minutes=CACHE_TTL)):
             return _cache
         try:
-            odds, screenshot = scrape_iddaa()
-            _cache.update({'odds': odds, 'screenshot': screenshot,
-                           'ts': now, 'count': len(odds), 'error': None})
+            odds = scrape_iddaa()
+            _cache.update({'odds': odds, 'ts': now,
+                           'count': len(odds), 'error': None})
         except Exception as e:
             log.error(f"Scrape hatası: {e}")
             _cache['error'] = str(e)
@@ -178,7 +186,7 @@ def get_cached_odds(force: bool = False) -> dict:
 
 def check_auth():
     return (request.headers.get('X-API-Key')
-            or request.args.get('key')) == API_SECRET
+            or request.args.get('key')) == IDDAA_KEY
 
 
 @app.route('/health')
@@ -199,18 +207,7 @@ def get_odds():
                     'error': cache.get('error')})
 
 
-@app.route('/screenshot')
-def get_screenshot():
-    if not check_auth():
-        return jsonify({'error': 'Yetkisiz erişim'}), 401
-    cache = get_cached_odds()
-    if not cache.get('screenshot'):
-        return jsonify({'error': 'Henüz ekran görüntüsü yok'}), 404
-    return jsonify({'screenshot_b64': cache['screenshot'],
-                    'taken_at': cache['ts'].isoformat() if cache.get('ts') else None})
-
-
-@app.route('/refresh', methods=['POST'])
+@app.route('/refresh', methods=['POST', 'GET'])
 def force_refresh():
     if not check_auth():
         return jsonify({'error': 'Yetkisiz erişim'}), 401
