@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-API_SECRET = os.environ.get('API_SECRET', 'trinity_secret_key')
+API_SECRET = os.environ.get('IDDAA_KEY', 'trinity2024')
 CACHE_TTL  = int(os.environ.get('CACHE_TTL_MIN', '30'))
 PORT       = int(os.environ.get('PORT', 8080))
 
