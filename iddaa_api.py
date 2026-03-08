@@ -153,6 +153,24 @@ def get_football_odds_bot():
         return jsonify({"error": str(e)}), 500
 
 
+
+@app.route("/debug/sample", methods=["GET"])
+def debug_sample():
+    """İlk 2 maçın ham verisini döner - outcome key'lerini görmek için."""
+    try:
+        resp = requests.get(
+            EVENTS_URL,
+            headers=HEADERS,
+            params={"st": 1, "type": 0, "version": 0},
+            timeout=10,
+        )
+        data = resp.json()
+        events = data.get("data", {}).get("events", [])
+        football = [e for e in events if e.get("sid") == 1][:2]
+        return jsonify({"raw_sample": football})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
